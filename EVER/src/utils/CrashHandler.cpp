@@ -109,6 +109,35 @@ static bool IsGtaIntentionalTerminate(const EXCEPTION_POINTERS* ep) {
            (ep->ExceptionRecord->ExceptionInformation[1] == 0);
 }
 
+static bool IsStreamingArchetypeSentinelCrash(const EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return false;
+    if (ep->ExceptionRecord->NumberParameters < 2)
+        return false;
+
+    if (ep->ExceptionRecord->ExceptionInformation[0] != 0)
+        return false;
+
+    if (ep->ExceptionRecord->ExceptionInformation[1] != 0xFFFFFFFFFFFFFFFFULL)
+        return false;
+    
+    HMODULE hModule = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress),
+            &hModule)) {
+        return false;
+    }
+    char modulePath[MAX_PATH] = {};
+    if (!GetModuleFileNameA(hModule, modulePath, MAX_PATH))
+        return false;
+    for (char* p = modulePath; *p; ++p)
+        *p = static_cast<char>(::tolower(static_cast<unsigned char>(*p)));
+    return ::strstr(modulePath, "gta-core-five.dll") != nullptr ||
+           ::strstr(modulePath, "gta-streaming-five.dll") != nullptr;
+}
+
 static const char* ExceptionCodeStr(DWORD code) {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:         return "ACCESS_VIOLATION";
@@ -439,6 +468,9 @@ static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
     if (IsExceptionFromBlacklistedModule(ep->ExceptionRecord->ExceptionAddress))
         return EXCEPTION_CONTINUE_SEARCH;
 
+    if (IsStreamingArchetypeSentinelCrash(ep))
+        return EXCEPTION_CONTINUE_SEARCH;
+
     if (InterlockedCompareExchange(&g_crashInProgress, 1L, 0L) != 0L)
         return EXCEPTION_CONTINUE_SEARCH;
 
@@ -450,6 +482,11 @@ static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
 
 static LONG WINAPI UnhandledCrashHandler(EXCEPTION_POINTERS* ep) {
     if (IsNonFatalException(ep->ExceptionRecord->ExceptionCode)) {
+        return g_previousExceptionFilter
+               ? g_previousExceptionFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (IsStreamingArchetypeSentinelCrash(ep)) {
         return g_previousExceptionFilter
                ? g_previousExceptionFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
     }
