@@ -114,10 +114,13 @@ static bool IsRTDynamicCastNullRttiCrash(const EXCEPTION_POINTERS* ep) {
         return false;
     if (ep->ExceptionRecord->NumberParameters < 2)
         return false;
+
     if (ep->ExceptionRecord->ExceptionInformation[0] != 0)
         return false;
-    if (ep->ExceptionRecord->ExceptionInformation[1] != 0x0000000000000004ULL)
+
+    if (ep->ExceptionRecord->ExceptionInformation[1] >= 0x100ULL)
         return false;
+
     HMODULE hModule = nullptr;
     if (!GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -143,7 +146,8 @@ static bool IsStreamingArchetypeSentinelCrash(const EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionInformation[0] != 0)
         return false;
 
-    if (ep->ExceptionRecord->ExceptionInformation[1] != 0xFFFFFFFFFFFFFFFFULL)
+    const ULONG_PTR faultAddr = ep->ExceptionRecord->ExceptionInformation[1];
+    if (faultAddr != 0xFFFFFFFFFFFFFFFFULL && faultAddr != 0x0000000000000000ULL)
         return false;
 
     HMODULE hModule = nullptr;
