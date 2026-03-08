@@ -41,7 +41,7 @@ namespace ever {
             // Dual-pass audio rendering functions
             const std::string startBakeProject = 
                 "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 40 32 FF 48 83 3D ?? ?? ?? ?? 00 48 8B DA 48 8B F1";
-
+                
             // CVideoEditorUi::TriggerExport - Not needed anymore
             //const std::string triggerExport = "83 CA FF 8D 4A 02 E8 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 EB ?? 48 83 64 24 28 00 48 83 64 24 20 00 45 33 C9 45 8D 41 02 48 8D 15 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ??";
 
@@ -55,7 +55,7 @@ namespace ever {
 
             // Is pending bake start
             const std::string isPendingBakeStart =
-                "83 3D ?? ?? ?? ?? ?? 0F 94 C0 C3 CC 40 53 48 83 EC ?? 8B 0D";
+                "8A C3 48 83 C4 20 5B C3 83 3D ?? ?? ?? ?? 04 0F 94 C0 C3 ?? 40 53 48 83 EC 20 8B 0D ?? ?? ?? ?? 33 DB 83 F9 FF";
 
             // Is pending cleanup
             const std::string isPendingCleanup =

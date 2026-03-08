@@ -207,6 +207,7 @@ namespace {
     
     // Store IsPendingBakeStart address for hook to access
     uint64_t g_isPendingBakeStartAddress = 0;
+    uint32_t* g_isPendingBakeStartStatePtr = nullptr;
 
     bool bindExportSwapChainIfAvailableLocked() {
         if (!exportContext) {
@@ -554,6 +555,39 @@ namespace {
         return true;
     }
 
+    uint64_t resolveIsPendingBakeStartFunction(uint64_t patternMatchAddress) {
+        if (patternMatchAddress == 0) {
+            return 0;
+        }
+
+        const auto* base = reinterpret_cast<const uint8_t*>(patternMatchAddress);
+
+        for (size_t i = 0; i < 64; ++i) {
+            const uint8_t* p = base + i;
+            if (p[0] == 0x83 && p[1] == 0x3D && p[6] == 0x04 && p[7] == 0x0F && p[8] == 0x94 && p[9] == 0xC0 && p[10] == 0xC3) {
+                return reinterpret_cast<uint64_t>(p);
+            }
+        }
+
+        return patternMatchAddress;
+    }
+
+    uint32_t* resolveIsPendingBakeStartStatePointer(uint64_t functionAddress) {
+        if (functionAddress == 0) {
+            return nullptr;
+        }
+
+        const auto* p = reinterpret_cast<const uint8_t*>(functionAddress);
+        if (!(p[0] == 0x83 && p[1] == 0x3D)) {
+            return nullptr;
+        }
+
+        int32_t disp = 0;
+        std::memcpy(&disp, p + 2, sizeof(disp));
+        const uint64_t ripAfterCmp = functionAddress + 7;
+        return reinterpret_cast<uint32_t*>(ripAfterCmp + disp);
+    }
+
     // Manual hook CleanupReplayPlaybackInternal
     bool installManualHookWithTrampoline(uint64_t targetAddress, uintptr_t hookAddress, void** outTrampoline) {
         if (targetAddress == 0 || hookAddress == 0) {
@@ -822,17 +856,9 @@ namespace {
     bool IsPendingBakeStart_Hook() {
         PRE();
         
-        static uint32_t* g_bakeStatePtr = nullptr;
-        if (!g_bakeStatePtr && g_isPendingBakeStartAddress) {
-            const uint64_t ripAfterCmp = g_isPendingBakeStartAddress + 7;
-            const int32_t offset = 0x01DD1525; // This might change in the future?
-            g_bakeStatePtr = reinterpret_cast<uint32_t*>(ripAfterCmp + offset);
-            LOG(LL_DBG, "IsPendingBakeStart: Calculated state pointer: ", reinterpret_cast<void*>(g_bakeStatePtr));
-        }
-        
         bool originalResult = false;
-        if (g_bakeStatePtr) {
-            originalResult = (*g_bakeStatePtr == 4);
+        if (g_isPendingBakeStartStatePtr) {
+            originalResult = (*g_isPendingBakeStartStatePtr == 4);
         }
         
         LOG(LL_TRC, "IsPendingBakeStart called, original result: ", originalResult);
@@ -1437,7 +1463,22 @@ void ever::initialize() {
             }
             
             if (pIsPendingBakeStart) {
-                g_isPendingBakeStartAddress = pIsPendingBakeStart; // Store for hook to access
+                const uint64_t resolvedIsPendingBakeStart = resolveIsPendingBakeStartFunction(pIsPendingBakeStart);
+                if (resolvedIsPendingBakeStart != pIsPendingBakeStart) {
+                    LOG(LL_DBG, "IsPendingBakeStart anchor adjusted from ",
+                        Logger::hex(pIsPendingBakeStart, 16), " to ",
+                        Logger::hex(resolvedIsPendingBakeStart, 16));
+                }
+
+                pIsPendingBakeStart = resolvedIsPendingBakeStart;
+                g_isPendingBakeStartStatePtr = resolveIsPendingBakeStartStatePointer(pIsPendingBakeStart);
+                if (g_isPendingBakeStartStatePtr) {
+                    LOG(LL_DBG, "IsPendingBakeStart state pointer resolved at ",
+                        reinterpret_cast<void*>(g_isPendingBakeStartStatePtr));
+                } else {
+                    LOG(LL_WRN, "IsPendingBakeStart: Could not resolve state pointer from function bytes");
+                }
+                g_isPendingBakeStartAddress = pIsPendingBakeStart;
                 const auto hookAddr = reinterpret_cast<uintptr_t>(&IsPendingBakeStart_Hook);
                 // Note: Function is 11 bytes but we patch 12 bytes - should be safe
                 if (installAbsoluteJumpHook(pIsPendingBakeStart, hookAddr)) {
