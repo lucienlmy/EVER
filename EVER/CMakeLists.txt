@@ -1,6 +1,23 @@
 set(PROJECT_NAME EVER)
 
 ################################################################################
+# Build metadata (version/tag + build date)
+################################################################################
+set(EVER_BUILD_VERSION "v0.0.0-LOCAL_BUILD")
+
+# GitHub Actions tag builds: prefer the tag name when available.
+if(DEFINED ENV{GITHUB_REF_TYPE} AND "$ENV{GITHUB_REF_TYPE}" STREQUAL "tag" AND DEFINED ENV{GITHUB_REF_NAME} AND NOT "$ENV{GITHUB_REF_NAME}" STREQUAL "")
+        set(EVER_BUILD_VERSION "$ENV{GITHUB_REF_NAME}")
+elseif(DEFINED ENV{GITHUB_REF} AND NOT "$ENV{GITHUB_REF}" STREQUAL "")
+        string(REGEX MATCH "^refs/tags/(.+)$" _ever_tag_match "$ENV{GITHUB_REF}")
+        if(CMAKE_MATCH_1)
+                set(EVER_BUILD_VERSION "${CMAKE_MATCH_1}")
+        endif()
+endif()
+
+string(TIMESTAMP EVER_BUILD_DATE "%Y-%m-%d %H:%M:%S UTC" UTC)
+
+################################################################################
 # Resource fix
 ################################################################################
 foreach(LANG  C CXX RC)
@@ -194,6 +211,8 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
         "_USRDLL;"
         "EVER_EXPORTS;"
         "TARGET_NAME=\"${TARGET_NAME}\";"
+        "EVER_BUILD_VERSION=\"${EVER_BUILD_VERSION}\";"
+        "EVER_BUILD_DATE=\"${EVER_BUILD_DATE}\";"
         "_CRT_SECURE_NO_WARNINGS;"
         "_WIN32_WINNT=0x0601"
         )

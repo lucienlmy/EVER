@@ -4,6 +4,14 @@
 
 #include <iostream>
 
+#ifndef EVER_BUILD_VERSION
+#define EVER_BUILD_VERSION "v0.0.0-LOCAL_BUILD"
+#endif
+
+#ifndef EVER_BUILD_DATE
+#define EVER_BUILD_DATE __DATE__ " " __TIME__
+#endif
+
 Logger::Logger() { ensureStream(); }
 
 Logger::~Logger() {
@@ -26,6 +34,7 @@ bool Logger::ensureStream() {
     if (this->filestream.is_open()) {
         std::lock_guard<std::mutex> guard(mtx);
         filestream << "Logger initialized." << "\r\n";
+        filestream << "EVER version: " << EVER_BUILD_VERSION << " @ " << EVER_BUILD_DATE << "\r\n";
         return true;
     }
     return false;
