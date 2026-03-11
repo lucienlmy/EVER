@@ -12,6 +12,7 @@
 #include <dxgi.h>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <mfidl.h>
 #include <mutex>
@@ -65,6 +66,16 @@ namespace Encoder {
         bool isCapturing = false;
 
     private:
+        struct QueuedVideoFrame {
+            std::vector<uint8_t> data;
+            int rowPitch = 0;
+            int32_t height = 0;
+            int64_t frameIndex = 0;
+        };
+
+        void videoEncodingWorkerLoop();
+        HRESULT encodeQueuedVideoFrame(const QueuedVideoFrame& frame);
+
         std::unique_ptr<FFmpegEncoder> ffmpegEncoder_;
         FFmpeg::FFVIDEOFRAME videoFrame_;
         FFmpeg::FFAUDIOCHUNK audioChunk_;
@@ -80,6 +91,22 @@ namespace Encoder {
         std::mutex finishMutex_;
         std::mutex endSessionMutex_;
         std::condition_variable endSessionCondition_;
+
+        std::mutex videoQueueMutex_;
+        std::condition_variable videoQueueNotEmptyCv_;
+        std::condition_variable videoQueueNotFullCv_;
+        std::deque<QueuedVideoFrame> videoQueue_;
+        std::thread videoEncodingThread_;
+        bool videoQueueStopRequested_ = false;
+        bool videoWorkerRunning_ = false;
+        bool videoWorkerFailed_ = false;
+        static constexpr size_t kMaxQueuedVideoFrames = 8;
+        int64_t queuedVideoFrames_ = 0;
+        int64_t encodedVideoFrames_ = 0;
+        int64_t submittedAudioSamples_ = 0;
+        int64_t droppedVideoFrames_ = 0;
+        int32_t fpsNumerator_ = 0;
+        int32_t fpsDenominator_ = 1;
 
         SafeQueue<FrameQueueItem> videoFrameQueue_;
         SafeQueue<ExrQueueItem> exrImageQueue_;

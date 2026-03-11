@@ -6,11 +6,74 @@
 #include "logger.h"
 #include "util.h"
 
+#include <cmath>
 #include <filesystem>
 
 #pragma warning(pop)
 
 namespace Encoder {
+    void EncoderSession::videoEncodingWorkerLoop() {
+        PRE();
+        LOG(LL_NFO, "EncoderSession video worker started");
+
+        while (true) {
+            QueuedVideoFrame frame;
+            {
+                std::unique_lock<std::mutex> lock(videoQueueMutex_);
+                videoQueueNotEmptyCv_.wait(lock, [this] {
+                    return videoQueueStopRequested_ || !videoQueue_.empty();
+                });
+
+                if (videoQueue_.empty()) {
+                    if (videoQueueStopRequested_) {
+                        break;
+                    }
+                    continue;
+                }
+
+                frame = std::move(videoQueue_.front());
+                videoQueue_.pop_front();
+                videoQueueNotFullCv_.notify_one();
+            }
+
+            const HRESULT hr = encodeQueuedVideoFrame(frame);
+            if (FAILED(hr)) {
+                LOG(LL_ERR, "Video worker failed to encode queued frame index=", frame.frameIndex,
+                    " hr=", Logger::hex(static_cast<uint32_t>(hr), 8));
+                std::lock_guard<std::mutex> lock(videoQueueMutex_);
+                videoWorkerFailed_ = true;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(videoQueueMutex_);
+            videoWorkerRunning_ = false;
+        }
+        LOG(LL_NFO, "EncoderSession video worker stopped. encodedFrames=", encodedVideoFrames_,
+            " droppedFrames=", droppedVideoFrames_);
+        POST();
+    }
+
+    HRESULT EncoderSession::encodeQueuedVideoFrame(const QueuedVideoFrame& frame) {
+        PRE();
+        if (frame.data.empty()) {
+            LOG(LL_ERR, "encodeQueuedVideoFrame called with empty frame data");
+            POST();
+            return E_FAIL;
+        }
+
+        const int32_t lengthBytes = static_cast<int32_t>(frame.rowPitch * frame.height);
+        const HRESULT hr = writeVideoFrame(const_cast<BYTE*>(frame.data.data()),
+                                           lengthBytes,
+                                           frame.rowPitch,
+                                           frame.frameIndex);
+        if (SUCCEEDED(hr)) {
+            ++encodedVideoFrames_;
+        }
+        POST();
+        return hr;
+    }
+
     EncoderSession::EncoderSession() 
         : videoFrameQueue_(128), 
         exrImageQueue_(16) {
@@ -39,6 +102,16 @@ namespace Encoder {
         audioChunk_.sampleRate = 0;
         audioChunk_.layout = FFmpeg::ChannelLayout::Stereo;
         memset(audioChunk_.format, 0, sizeof(audioChunk_.format));
+
+        videoQueueStopRequested_ = false;
+        videoWorkerRunning_ = false;
+        videoWorkerFailed_ = false;
+        queuedVideoFrames_ = 0;
+        encodedVideoFrames_ = 0;
+        submittedAudioSamples_ = 0;
+        droppedVideoFrames_ = 0;
+        fpsNumerator_ = 0;
+        fpsDenominator_ = 1;
         
         LOG(LL_DBG, "EncoderSession: Initialization complete");
         POST();
@@ -77,6 +150,8 @@ namespace Encoder {
         
         width_ = static_cast<int32_t>(width);
         height_ = static_cast<int32_t>(height);
+        fpsNumerator_ = static_cast<int32_t>(fpsNumerator);
+        fpsDenominator_ = static_cast<int32_t>(fpsDenominator == 0 ? 1 : fpsDenominator);
 
         ASSERT_RUNTIME(filename.length() < 255, 
                     "Filename is too long for FFmpeg encoder");
@@ -164,6 +239,30 @@ namespace Encoder {
 
         isCapturing = true;
 
+        {
+            std::lock_guard<std::mutex> lock(videoQueueMutex_);
+            videoQueueStopRequested_ = false;
+            videoWorkerFailed_ = false;
+            videoWorkerRunning_ = true;
+            videoQueue_.clear();
+            queuedVideoFrames_ = 0;
+            encodedVideoFrames_ = 0;
+            droppedVideoFrames_ = 0;
+        }
+
+        try {
+            videoEncodingThread_ = std::thread(&EncoderSession::videoEncodingWorkerLoop, this);
+            LOG(LL_NFO, "EncoderSession::createContext - Video worker thread started");
+        } catch (const std::exception& ex) {
+            LOG(LL_ERR, "EncoderSession::createContext - Failed to start video worker thread: ", ex.what());
+            POST();
+            return E_FAIL;
+        } catch (...) {
+            LOG(LL_ERR, "EncoderSession::createContext - Failed to start video worker thread");
+            POST();
+            return E_FAIL;
+        }
+
         LOG(LL_NFO, "EncoderSession::createContext - Encoder context creation complete");
         POST();
         return S_OK;
@@ -199,13 +298,46 @@ namespace Encoder {
             return E_FAIL;
         }
 
-        LOG(LL_NFO, "Encoding video frame: ", videoPts_);
-        
-        REQUIRE(writeVideoFrame(static_cast<BYTE*>(subresource.pData), 
-                            static_cast<int32_t>(subresource.DepthPitch),
-                            subresource.RowPitch, 
-                            videoPts_++),
-                "Failed to write video frame");
+        if (subresource.pData == nullptr || subresource.RowPitch <= 0 || height_ <= 0) {
+            LOG(LL_ERR, "enqueueVideoFrame received invalid mapped resource");
+            POST();
+            return E_FAIL;
+        }
+
+        QueuedVideoFrame frame;
+        frame.rowPitch = static_cast<int>(subresource.RowPitch);
+        frame.height = height_;
+        frame.frameIndex = videoPts_++;
+
+        const size_t frameBytes = static_cast<size_t>(frame.rowPitch) * static_cast<size_t>(frame.height);
+        frame.data.resize(frameBytes);
+        std::memcpy(frame.data.data(), subresource.pData, frameBytes);
+
+        std::unique_lock<std::mutex> lock(videoQueueMutex_);
+        if (videoQueue_.size() >= kMaxQueuedVideoFrames) {
+            LOG(LL_DBG, "Video queue full (", videoQueue_.size(), "/", kMaxQueuedVideoFrames,
+                ") waiting for encoder worker...");
+        }
+
+        videoQueueNotFullCv_.wait(lock, [this] {
+            return videoQueueStopRequested_ || videoQueue_.size() < kMaxQueuedVideoFrames;
+        });
+
+        if (videoQueueStopRequested_) {
+            LOG(LL_WRN, "Video queue stop requested; dropping frame ", frame.frameIndex);
+            ++droppedVideoFrames_;
+            POST();
+            return E_FAIL;
+        }
+
+        videoQueue_.push_back(std::move(frame));
+        ++queuedVideoFrames_;
+        const size_t queueDepth = videoQueue_.size();
+        lock.unlock();
+        videoQueueNotEmptyCv_.notify_one();
+
+        LOG(LL_TRC, "Queued video frame index=", (videoPts_ - 1), " depth=", queueDepth,
+            " maxDepth=", kMaxQueuedVideoFrames);
 
         POST();
         return S_OK;
@@ -256,6 +388,7 @@ namespace Encoder {
 
         audioChunk_.buffer[0] = data;
         audioChunk_.samples = samples;
+        submittedAudioSamples_ += samples;
 
         LOG(LL_TRC, "EncoderSession::writeAudioFrame - Sending audio chunk to FFmpeg encoder");
         REQUIRE(ffmpegEncoder_->SendAudioSampleChunk(audioChunk_), "Failed to send audio chunk to FFmpeg");
@@ -269,6 +402,18 @@ namespace Encoder {
         std::lock_guard<std::mutex> guard(finishMutex_);
 
         if (!isVideoFinished_) {
+            {
+                std::lock_guard<std::mutex> lock(videoQueueMutex_);
+                videoQueueStopRequested_ = true;
+            }
+            videoQueueNotEmptyCv_.notify_all();
+            videoQueueNotFullCv_.notify_all();
+
+            if (videoEncodingThread_.joinable()) {
+                LOG(LL_NFO, "Waiting for video worker to drain queued frames...");
+                videoEncodingThread_.join();
+            }
+
             if (exrEncodingThread_.joinable()) {
                 exrImageQueue_.enqueue(ExrQueueItem());
                 
@@ -291,6 +436,12 @@ namespace Encoder {
             }
 
             isVideoFinished_ = true;
+
+            if (videoWorkerFailed_) {
+                LOG(LL_ERR, "finishVideo detected video worker encoding failure");
+                POST();
+                return E_FAIL;
+            }
         }
 
         POST();
@@ -332,6 +483,25 @@ namespace Encoder {
 
         isCapturing = false;
         LOG(LL_NFO, "Ending encoding session...");
+
+        if (fpsNumerator_ > 0 && fpsDenominator_ > 0 && inputAudioSampleRate_ > 0) {
+            const double videoDurationSec = static_cast<double>(encodedVideoFrames_) *
+                                            static_cast<double>(fpsDenominator_) /
+                                            static_cast<double>(fpsNumerator_);
+            const double audioDurationSec = static_cast<double>(submittedAudioSamples_) /
+                                            static_cast<double>(inputAudioSampleRate_);
+            const double deltaSec = std::fabs(videoDurationSec - audioDurationSec);
+
+            LOG(LL_NFO, "A/V sync telemetry: encodedVideoFrames=", encodedVideoFrames_,
+                " submittedAudioSamples=", submittedAudioSamples_,
+                " videoDurationSec=", videoDurationSec,
+                " audioDurationSec=", audioDurationSec,
+                " deltaSec=", deltaSec);
+
+            if (deltaSec > 0.250) {
+                LOG(LL_WRN, "A/V sync delta is high (>", 0.250, "s). Check capture cadence and audio replay chunking.");
+            }
+        }
 
         if (ffmpegEncoder_) {
             LOG(LL_DBG, "EncoderSession::endSession - Closing FFmpeg encoder");

@@ -180,6 +180,40 @@ namespace {
     };
 
     std::unique_ptr<DualPassContext> dualPassContext;
+    std::atomic_bool ffmpegExportFailed = false;
+    std::mutex ffmpegExportFailureMutex;
+    std::string ffmpegExportFailureStage;
+    std::atomic_bool asyncFinalizeInProgress = false;
+    std::atomic_bool asyncFinalizeCompleted = false;
+    std::atomic_bool asyncFinalizeFailed = false;
+
+    void markFfmpegExportFailure(const char* stage, const HRESULT hr = E_FAIL) {
+        ffmpegExportFailed = true;
+        std::ostringstream oss;
+        oss << stage << " hr=" << Logger::hex(static_cast<uint32_t>(hr), 8);
+        {
+            std::lock_guard<std::mutex> lock(ffmpegExportFailureMutex);
+            ffmpegExportFailureStage = oss.str();
+        }
+        LOG(LL_ERR, "FFmpeg export marked as failed at stage: ", ffmpegExportFailureStage);
+    }
+
+    void clearFfmpegExportFailure() {
+        ffmpegExportFailed = false;
+        std::lock_guard<std::mutex> lock(ffmpegExportFailureMutex);
+        ffmpegExportFailureStage.clear();
+    }
+
+    std::string getFfmpegExportFailureStage() {
+        std::lock_guard<std::mutex> lock(ffmpegExportFailureMutex);
+        return ffmpegExportFailureStage;
+    }
+
+    void clearAsyncFinalizeState() {
+        asyncFinalizeInProgress = false;
+        asyncFinalizeCompleted = false;
+        asyncFinalizeFailed = false;
+    }
 
     // Manual hooks for functions that can't use PolyHook
     using CleanupReplayPlaybackInternalFunc = void(*)();
@@ -452,6 +486,15 @@ namespace {
 
         return isPass1SuccessLabel(pTextLabel) ||
                std::strcmp(pTextLabel, "VE_BAKE_ERROR") == 0;
+    }
+
+    bool isExportCompletionLabel(const char* pTextLabel) {
+        if (!pTextLabel) {
+            return false;
+        }
+
+        return std::strcmp(pTextLabel, "VE_BAKE_FIN") == 0 ||
+               std::strcmp(pTextLabel, "VE_BAKE_FIN_NAMED") == 0;
     }
 
     bool isDualPassTransitionState() {
@@ -982,6 +1025,19 @@ namespace {
             " type=", type,
             " allowSpinner=", allowSpinner,
             " dualPass=", dualPassContext ? dualPassStateName(dualPassContext->state) : "NO_CONTEXT");
+
+        if (asyncFinalizeInProgress.load() && isExportCompletionLabel(pTextLabel)) {
+            LOG(LL_NFO, "Suppressing export-complete popup while async FFmpeg finalization is running.");
+            tryForceWantDelayedCloseFalse("SetUserConfirmationScreen_Hook(async-finalize)");
+            POST();
+            return;
+        }
+
+        if (asyncFinalizeCompleted.load() &&
+            (isExportCompletionLabel(pTextLabel) || std::strcmp(safeLabel.c_str(), "VE_BAKE_ERROR") == 0)) {
+            LOG(LL_NFO, "Clearing async finalization state after terminal export dialog. label=", safeLabel);
+            clearAsyncFinalizeState();
+        }
 
         if (dualPassContext &&
             isPass1TransitionSuppressLabel(pTextLabel) &&
@@ -2114,6 +2170,7 @@ HRESULT IMFSinkWriterHooks::SetInputMediaType::Implementation(IMFSinkWriter* pTh
                 }
             } catch (std::exception& ex) {
                 LOG(LL_ERR, ex.what());
+                markFfmpegExportFailure("SetInputMediaType", MF_E_INVALIDMEDIATYPE);
                 LOG_CALL(LL_DBG, encodingSession.reset());
                 LOG_CALL(LL_DBG, ::exportContext.reset());
                 
@@ -2188,11 +2245,13 @@ HRESULT IMFSinkWriterHooks::WriteSample::Implementation(IMFSinkWriter* pThis, DW
                     }
                 } catch (std::exception& ex) {
                     LOG(LL_ERR, ex.what());
+                    markFfmpegExportFailure("WriteSample::audio-frame", E_FAIL);
                 }
                 pBuffer->Unlock();
             }
         } catch (std::exception& ex) {
             LOG(LL_ERR, ex.what());
+            markFfmpegExportFailure("WriteSample::exception", E_FAIL);
             LOG_CALL(LL_DBG, encodingSession.reset());
             LOG_CALL(LL_DBG, ::exportContext.reset());
             
@@ -2228,6 +2287,10 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
     }
     
     std::lock_guard<std::mutex> sessionLock(mxSession);
+    HRESULT originalFinalizeResult = S_OK;
+    bool originalFinalizeCalled = false;
+    bool ffmpegFinalizeSuccess = !ffmpegExportFailed.load();
+
     try {
         if (encodingSession != NULL) {
             // Check if this is Pass 1 completing
@@ -2257,6 +2320,8 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
                 // Call original to trigger GTA's cleanup
                 LOG(LL_DBG, "Executing: OriginalFunc(pThis)...");
                 HRESULT result = OriginalFunc(pThis);
+                originalFinalizeResult = result;
+                originalFinalizeCalled = true;
                 
                 LOG(LL_NFO, "Original Finalize returned: ", Logger::hex(result, 8));
                 LOG(LL_NFO, "Pass 1: overriding Finalize return to S_OK for handoff stability");
@@ -2278,16 +2343,131 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
             } else if (dualPassContext && dualPassContext->state == DualPassState::PASS2_RUNNING) {
                 // Pass 2 complete
                 LOG(LL_NFO, "PASS 2 COMPLETE - Video Export Finished");
-                
-                // Finalize FFmpeg encoder
-                LOG(LL_DBG, "Finalizing audio stream...");
-                LOG_CALL(LL_DBG, encodingSession->finishAudio());
-                
-                LOG(LL_DBG, "Finalizing video stream...");
-                LOG_CALL(LL_DBG, encodingSession->finishVideo());
-                
-                LOG(LL_DBG, "Ending encoding session...");
-                LOG_CALL(LL_DBG, encodingSession->endSession());
+
+                if (encodingSession && dualPassContext->audio_buffer_playback_position < dualPassContext->audio_buffer.size()) {
+                    const size_t bytesRemaining =
+                        dualPassContext->audio_buffer.size() - dualPassContext->audio_buffer_playback_position;
+                    const uint32_t blockAlign = std::max<uint32_t>(1, dualPassContext->audio_block_align);
+                    const size_t chunkAlign = static_cast<size_t>(blockAlign);
+                    const size_t rawChunk = static_cast<size_t>(blockAlign) * 1024;
+
+                    LOG(LL_NFO, "Draining remaining buffered audio before async finalization. remainingBytes=",
+                        bytesRemaining, " blockAlign=", blockAlign);
+
+                    while (dualPassContext->audio_buffer_playback_position < dualPassContext->audio_buffer.size()) {
+                        const size_t pending = dualPassContext->audio_buffer.size() - dualPassContext->audio_buffer_playback_position;
+                        size_t chunkSize = std::min(rawChunk, pending);
+                        chunkSize = (chunkSize / chunkAlign) * chunkAlign;
+                        if (chunkSize == 0) {
+                            // Keep alignment guarantees for PCM frame boundaries.
+                            chunkSize = pending - (pending % chunkAlign);
+                        }
+                        if (chunkSize == 0) {
+                            break;
+                        }
+
+                        BYTE* bufferedAudio = dualPassContext->audio_buffer.data() + dualPassContext->audio_buffer_playback_position;
+                        const HRESULT drainHr = encodingSession->writeAudioFrame(
+                            bufferedAudio,
+                            static_cast<int32_t>(chunkSize),
+                            0);
+
+                        if (FAILED(drainHr)) {
+                            ffmpegFinalizeSuccess = false;
+                            markFfmpegExportFailure("Finalize::drainRemainingAudio", drainHr);
+                            LOG(LL_ERR, "Failed while draining remaining buffered audio");
+                            break;
+                        }
+
+                        dualPassContext->audio_buffer_playback_position += chunkSize;
+                    }
+
+                    const size_t postDrainRemaining =
+                        dualPassContext->audio_buffer.size() - dualPassContext->audio_buffer_playback_position;
+                    if (postDrainRemaining > 0) {
+                        LOG(LL_WRN, "Audio drain ended with non-aligned remainder bytes=", postDrainRemaining);
+                    } else {
+                        LOG(LL_NFO, "Buffered audio drain complete");
+                    }
+                }
+
+                std::unique_ptr<Encoder::EncoderSession> sessionForAsyncFinalize;
+                sessionForAsyncFinalize = std::move(encodingSession);
+
+                if (sessionForAsyncFinalize) {
+                    asyncFinalizeInProgress = true;
+                    asyncFinalizeCompleted = false;
+                    asyncFinalizeFailed = false;
+
+                    try {
+                        std::thread([session = std::move(sessionForAsyncFinalize)]() mutable {
+                            bool workerSuccess = true;
+                            try {
+                                LOG(LL_NFO, "Async FFmpeg finalization thread started");
+
+                                const HRESULT finishAudioHr = session->finishAudio();
+                                if (FAILED(finishAudioHr)) {
+                                    workerSuccess = false;
+                                    markFfmpegExportFailure("FinalizeAsync::finishAudio", finishAudioHr);
+                                }
+
+                                const HRESULT finishVideoHr = session->finishVideo();
+                                if (FAILED(finishVideoHr)) {
+                                    workerSuccess = false;
+                                    markFfmpegExportFailure("FinalizeAsync::finishVideo", finishVideoHr);
+                                }
+
+                                const HRESULT endSessionHr = session->endSession();
+                                if (FAILED(endSessionHr)) {
+                                    workerSuccess = false;
+                                    markFfmpegExportFailure("FinalizeAsync::endSession", endSessionHr);
+                                }
+                            } catch (const std::exception& ex) {
+                                workerSuccess = false;
+                                LOG(LL_ERR, "Async FFmpeg finalization exception: ", ex.what());
+                                markFfmpegExportFailure("FinalizeAsync::exception", E_FAIL);
+                            } catch (...) {
+                                workerSuccess = false;
+                                LOG(LL_ERR, "Async FFmpeg finalization unknown exception");
+                                markFfmpegExportFailure("FinalizeAsync::unknown", E_FAIL);
+                            }
+
+                            session.reset();
+
+                            asyncFinalizeFailed = !workerSuccess;
+                            asyncFinalizeCompleted = true;
+                            asyncFinalizeInProgress = false;
+
+                            if (workerSuccess) {
+                                clearFfmpegExportFailure();
+                                LOG(LL_NFO, "Async FFmpeg finalization completed successfully");
+                            } else {
+                                LOG(LL_ERR, "Async FFmpeg finalization failed. stage=", getFfmpegExportFailureStage());
+                            }
+                        }).detach();
+                    } catch (const std::exception& ex) {
+                        ffmpegFinalizeSuccess = false;
+                        markFfmpegExportFailure("FinalizeAsync::thread-start", E_FAIL);
+                        LOG(LL_ERR, "Failed to start async FFmpeg finalization thread: ", ex.what());
+                        asyncFinalizeFailed = true;
+                        asyncFinalizeCompleted = true;
+                        asyncFinalizeInProgress = false;
+                    } catch (...) {
+                        ffmpegFinalizeSuccess = false;
+                        markFfmpegExportFailure("FinalizeAsync::thread-start-unknown", E_FAIL);
+                        LOG(LL_ERR, "Failed to start async FFmpeg finalization thread (unknown exception)");
+                        asyncFinalizeFailed = true;
+                        asyncFinalizeCompleted = true;
+                        asyncFinalizeInProgress = false;
+                    }
+                } else {
+                    LOG(LL_WRN, "Pass 2 finalize: no encoding session available for async finalization");
+                    asyncFinalizeFailed = true;
+                    asyncFinalizeCompleted = true;
+                    asyncFinalizeInProgress = false;
+                    ffmpegFinalizeSuccess = false;
+                    markFfmpegExportFailure("FinalizeAsync::missing-session", E_FAIL);
+                }
                 
                 // Mark as complete BEFORE calling original Finalize
                 LOG(LL_NFO, "DUAL-PASS RENDERING COMPLETE");
@@ -2308,13 +2488,24 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
                 
                 // Clean up our resources
                 LOG(LL_DBG, "Cleaning up EVER resources...");
-                LOG_CALL(LL_DBG, encodingSession.reset());
                 LOG_CALL(LL_DBG, ::exportContext.reset());
                 LOG(LL_DBG, "EVER resources cleaned up");
+
+                LOG(LL_DBG, "Executing OriginalFunc(pThis) for PASS2 cleanup...");
+                originalFinalizeResult = OriginalFunc(pThis);
+                originalFinalizeCalled = true;
+                LOG(LL_NFO, "Original Finalize (Pass 2) returned: ", Logger::hex(originalFinalizeResult, 8));
                 
                 LOG(LL_NFO, "IMFSinkWriter::Finalize exit (Pass 2)");
                 POST();
-                return S_OK;
+                if (ffmpegFinalizeSuccess && !ffmpegExportFailed.load()) {
+                    // Async completion will publish final success/failure state.
+                    return S_OK;
+                }
+
+                LOG(LL_ERR, "Returning E_FAIL from Pass 2 finalize because FFmpeg export failed. stage=",
+                    getFfmpegExportFailureStage().empty() ? "<unknown>" : getFfmpegExportFailureStage());
+                return E_FAIL;
                 
             } else {
                 // Normal mode or other states - finalize encoder
@@ -2324,13 +2515,28 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
                     LOG(LL_NFO, "Finalizing encoder (normal single-pass mode)");
                 }
                 
-                LOG_CALL(LL_DBG, encodingSession->finishAudio());
-                LOG_CALL(LL_DBG, encodingSession->finishVideo());
-                LOG_CALL(LL_DBG, encodingSession->endSession());
+                const HRESULT finishAudioHr = encodingSession->finishAudio();
+                const HRESULT finishVideoHr = encodingSession->finishVideo();
+                const HRESULT endSessionHr = encodingSession->endSession();
+
+                if (FAILED(finishAudioHr)) {
+                    ffmpegFinalizeSuccess = false;
+                    markFfmpegExportFailure("Finalize::normal::finishAudio", finishAudioHr);
+                }
+                if (FAILED(finishVideoHr)) {
+                    ffmpegFinalizeSuccess = false;
+                    markFfmpegExportFailure("Finalize::normal::finishVideo", finishVideoHr);
+                }
+                if (FAILED(endSessionHr)) {
+                    ffmpegFinalizeSuccess = false;
+                    markFfmpegExportFailure("Finalize::normal::endSession", endSessionHr);
+                }
             }
         }
     } catch (std::exception& ex) {
         LOG(LL_ERR, "Exception in Finalize: ", ex.what());
+        ffmpegFinalizeSuccess = false;
+        markFfmpegExportFailure("Finalize::exception", E_FAIL);
         
         // Reset dual-pass context on error to prevent stale state
         if (dualPassContext && dualPassContext->state != DualPassState::IDLE) {
@@ -2350,7 +2556,21 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
     POST();
     
     // Call original Finalize to let GTA clean up
-    return OriginalFunc(pThis);
+    if (!originalFinalizeCalled) {
+        originalFinalizeResult = OriginalFunc(pThis);
+        originalFinalizeCalled = true;
+    }
+
+    LOG(LL_NFO, "Original Finalize returned: ", Logger::hex(originalFinalizeResult, 8));
+
+    if (ffmpegFinalizeSuccess && !ffmpegExportFailed.load()) {
+        clearFfmpegExportFailure();
+        return S_OK;
+    }
+
+    LOG(LL_ERR, "Returning E_FAIL from Finalize because FFmpeg export failed. stage=",
+        getFfmpegExportFailureStage().empty() ? "<unknown>" : getFfmpegExportFailureStage());
+    return E_FAIL;
 }
 
 void ever::finalize() {
@@ -2513,6 +2733,18 @@ bool GameHooks::HasVideoRenderErrored::Implementation() {
     PRE();
     const bool originalResult = OriginalFunc();
 
+    if (asyncFinalizeInProgress.load()) {
+        // During async trailer flush, keep Rockstar in non-error transition state.
+        POST();
+        return false;
+    }
+
+    if (asyncFinalizeCompleted.load() && asyncFinalizeFailed.load()) {
+        LOG(LL_ERR, "Reporting render error after async FFmpeg finalization failure.");
+        POST();
+        return true;
+    }
+
     if (dualPassContext &&
         (dualPassContext->state == DualPassState::PASS1_RUNNING ||
          dualPassContext->state == DualPassState::PASS1_COMPLETE ||
@@ -2532,6 +2764,12 @@ bool GameHooks::HasVideoRenderErrored::Implementation() {
 bool GameHooks::ShouldShowLoadingScreen::Implementation() {
     PRE();
     const bool originalResult = OriginalFunc();
+
+    if (asyncFinalizeInProgress.load()) {
+        // Keep Playback::CheckExportStatus in loading path until async finalize finishes.
+        POST();
+        return true;
+    }
 
     if (dualPassContext &&
         (dualPassContext->state == DualPassState::PASS1_COMPLETE ||
@@ -2570,6 +2808,8 @@ void CreateNewExportContext() {
     NOT_NULL(encodingSession, "Could not create the encoding session");
     ::exportContext.reset(new ExportContext());
     NOT_NULL(::exportContext, "Could not create export context");
+    clearFfmpegExportFailure();
+    clearAsyncFinalizeState();
     
     // Handle dual-pass overrides - must be set AFTER config reload
     LOG(LL_NFO, "CreateNewExportContext called");
