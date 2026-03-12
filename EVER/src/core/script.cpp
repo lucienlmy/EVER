@@ -248,12 +248,18 @@ namespace {
         double ripplesAccumulatorSec = 0.0;
         uint64_t ripplesCalls = 0;
         uint64_t ripplesSkipped = 0;
+        double clothAccumulatorSec = 0.0;
+        uint64_t clothCalls = 0;
+        uint64_t clothSkipped = 0;
         bool wasExportActive = false;
     };
 
     std::mutex g_temporalSyncMutex;
     TemporalSyncState g_temporalSyncState;
     std::atomic_bool g_loggedRipplesExportHit = false;
+    std::atomic_bool g_loggedClothExportHit = false;
+    // Pointer to rage::fwTimer::sm_systemTime.m_StepInSeconds
+    float* g_pClothSystemTimeStep = nullptr;
 
     constexpr double kTemporalSyncTargetStepSec = 1.0 / 30.0;
     constexpr double kTemporalSyncMaxAccumulatorSec = 0.25;
@@ -660,6 +666,9 @@ namespace {
         g_temporalSyncState.ripplesAccumulatorSec = 0.0;
         g_temporalSyncState.ripplesCalls = 0;
         g_temporalSyncState.ripplesSkipped = 0;
+        g_temporalSyncState.clothAccumulatorSec = 0.0;
+        g_temporalSyncState.clothCalls = 0;
+        g_temporalSyncState.clothSkipped = 0;
     }
 
     void updateTemporalSyncExportTransitionLocked(const bool exportActive) {
@@ -1566,6 +1575,7 @@ void ever::initialize() {
         uint64_t pHasVideoRenderErrored = NULL;
         uint64_t pShouldShowLoadingScreen = NULL;
         uint64_t pPuddlesRipplesUpdate = NULL;
+        uint64_t pClothManagerUpdate = NULL;
         
         patternScanner->addPattern("get_render_time_base_function", 
                                     ever::hooking::patterns::getRenderTimeBase, 
@@ -1592,17 +1602,20 @@ void ever::initialize() {
                                     ever::hooking::patterns::killPlaybackOrBake, 
                                     &pKillPlaybackOrBake);
         patternScanner->addPattern("set_user_confirmation_screen",
-                        ever::hooking::patterns::setUserConfirmationScreen,
-                        &pSetUserConfirmationScreen);
+                                    ever::hooking::patterns::setUserConfirmationScreen,
+                                    &pSetUserConfirmationScreen);
         patternScanner->addPattern("has_video_render_errored",
-                ever::hooking::patterns::hasVideoRenderErrored,
-                &pHasVideoRenderErrored);
+                                    ever::hooking::patterns::hasVideoRenderErrored,
+                                    &pHasVideoRenderErrored);
         patternScanner->addPattern("should_show_loading_screen",
-                ever::hooking::patterns::shouldShowLoadingScreen,
-                &pShouldShowLoadingScreen);
+                                    ever::hooking::patterns::shouldShowLoadingScreen,
+                                    &pShouldShowLoadingScreen);
         patternScanner->addPattern("puddles_ripples_update",
-                ever::hooking::patterns::puddlesRipplesUpdate,
-                &pPuddlesRipplesUpdate);
+                                    ever::hooking::patterns::puddlesRipplesUpdate,
+                                    &pPuddlesRipplesUpdate);
+        patternScanner->addPattern("cloth_manager_update",
+                                    ever::hooking::patterns::clothManagerUpdate,
+                                    &pClothManagerUpdate);
 
         patternScanner->performScan();
 
@@ -1629,6 +1642,7 @@ void ever::initialize() {
         logResolvedHookTarget("HasVideoRenderErrored", pHasVideoRenderErrored);
         logResolvedHookTarget("ShouldShowLoadingScreen", pShouldShowLoadingScreen);
         logResolvedHookTarget("PuddlesRipplesUpdate", pPuddlesRipplesUpdate);
+        logResolvedHookTarget("ClothManagerUpdate", pClothManagerUpdate);
 
         try {
             if (pGetRenderTimeBase) {
@@ -1803,6 +1817,39 @@ void ever::initialize() {
                 }
             } else {
                 LOG(LL_WRN, "Could not find PuddlesRipplesUpdate function.");
+            }
+
+            if (pClothManagerUpdate) {
+                const bool isExpectedEntry = memoryStartsWith(
+                    pClothManagerUpdate,
+                    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10});
+
+                if (!isExpectedEntry) {
+                    LOG(LL_WRN, "Skipping ClothManagerUpdate hook: resolved address does not match expected prologue");
+                    LOG(LL_WRN, "Flag/cloth wind simulation will NOT be corrected during video export.");
+                } else {
+                    const uint8_t* pInstr = reinterpret_cast<const uint8_t*>(pClothManagerUpdate) + 0x10F;
+                    if (pInstr[0] == 0xF3 && pInstr[1] == 0x0F && pInstr[2] == 0x10 && pInstr[3] == 0x05) {
+                        int32_t disp32 = 0;
+                        std::memcpy(&disp32, pInstr + 4, sizeof(disp32));
+                        g_pClothSystemTimeStep = reinterpret_cast<float*>(
+                            reinterpret_cast<uintptr_t>(pInstr) + 8 + disp32);
+                        LOG(LL_NFO, "sm_systemTime.m_StepInSeconds resolved at ",
+                            Logger::hex(reinterpret_cast<uint64_t>(g_pClothSystemTimeStep), 16));
+                    } else {
+                        LOG(LL_WRN, "ClothManagerUpdate: could not find sm_systemTime movss at expected offset.",
+                            " Bytes: ", Logger::hex(pInstr[0],2), " ", Logger::hex(pInstr[1],2),
+                            " ", Logger::hex(pInstr[2],2), " ", Logger::hex(pInstr[3],2));
+                    }
+                    PERFORM_X64_HOOK_WITH_SCHEME_REQUIRED(ClothManagerUpdate, pClothManagerUpdate,
+                                                          PLH::x64Detour::detour_scheme_t::INPLACE);
+                    LOG(LL_NFO, "ClothManagerUpdate hook installed. trampoline:",
+                        reinterpret_cast<void*>(GameHooks::ClothManagerUpdate::OriginalFunc));
+                    LOG(LL_DBG, "ClothManagerUpdate: will patch sm_systemTime.m_StepInSeconds to export sub-frame step during export");
+                }
+            } else {
+                LOG(LL_WRN, "Could not find ClothManagerUpdate function.");
+                LOG(LL_WRN, "Flag/cloth wind simulation may run too fast during video export.");
             }
             
             if (Config::Manager::disable_watermark) {
@@ -3033,6 +3080,30 @@ void GameHooks::PuddlesRipplesUpdate::Implementation(void* ripples, float rainyn
     }
 
     OriginalFunc(ripples, rainyness);
+    POST();
+}
+
+void GameHooks::ClothManagerUpdate::Implementation(void* thisPtr, int typeToUpdate) {
+    PRE();
+
+    if (!ever::isExportActive() || !g_pClothSystemTimeStep) {
+        OriginalFunc(thisPtr, typeToUpdate);
+        POST();
+        return;
+    }
+
+    const float exportStep = static_cast<float>(getCurrentExportRenderStepSeconds());
+    const float savedSystemStep = *g_pClothSystemTimeStep;
+    *g_pClothSystemTimeStep = exportStep;
+
+    if (!g_loggedClothExportHit.exchange(true)) {
+        LOG(LL_NFO, "ClothManagerUpdate: patching sm_systemTime.m_StepInSeconds ",
+            savedSystemStep * 1000.0f, "ms -> ", exportStep * 1000.0f, "ms",
+            " typeToUpdate=", typeToUpdate);
+    }
+
+    OriginalFunc(thisPtr, typeToUpdate);
+    *g_pClothSystemTimeStep = savedSystemStep;
     POST();
 }
 

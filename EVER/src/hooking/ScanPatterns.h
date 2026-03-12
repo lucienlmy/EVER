@@ -74,6 +74,10 @@ namespace ever {
             const std::string puddlesRipplesUpdate =
                 "48 83 EC 60 8A 05 ?? ?? ?? ?? 0F 29 74 24 50 0F 29 7C 24 40 0A 05 ?? ?? ?? ?? 48 8B D9 0A 05 ?? ?? ?? ?? 0F 28 F9 0A 05 ?? ?? ?? ?? 0F 85";
 
+            // clothManager::Update(int typeToUpdate)
+            const std::string clothManagerUpdate =
+                "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 20 F3 0F 10 05 ?? ?? ?? ?? 44 8B FA 48 8B E9";
+
             // Set user confirmation screen
             const std::string setUserConfirmationScreen =
                 "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 "

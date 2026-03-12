@@ -151,3 +151,8 @@ DEFINE_X64_HOOK(ShouldShowLoadingScreen, bool);
 // CVideoEditorPlayback::Close
 DEFINE_X64_HOOK(SetExportMenuMode, void,
                 int mode);
+
+// clothManager::Update(int typeToUpdate)
+DEFINE_X64_HOOK(ClothManagerUpdate, void,
+                void* thisPtr,
+                int typeToUpdate);
