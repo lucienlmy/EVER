@@ -238,11 +238,17 @@ namespace {
     uint8_t g_setUserConfirmationScreenOriginalBytes[12] = {0};
 
     std::atomic_bool g_pass2TriggerIssued = false;
+    std::atomic_bool g_pass2StartupPending = false;
+    std::atomic_int g_pass2StartupDelayFrames = 0;
+    constexpr int kPass2StartupDelayFrames = 60;
     uint8_t* g_wantDelayedClosePtr = nullptr;
     
     // Store IsPendingBakeStart address for hook to access
     uint64_t g_isPendingBakeStartAddress = 0;
     uint32_t* g_isPendingBakeStartStatePtr = nullptr;
+
+    void schedulePass2StartupOnMainThread(const char* reason);
+    bool executePass2StartupOnMainThread();
 
     struct TemporalSyncState {
         double ripplesAccumulatorSec = 0.0;
@@ -901,105 +907,9 @@ namespace {
                 POST();
                 return;
             }
-            
-            // Pass 2
-            std::thread([]() {
-                LOG(LL_NFO, "=== Pass 2 Trigger Thread Started ===");
-                LOG(LL_DBG, "Thread ID: ", std::this_thread::get_id());
-                
-                // Wait for cleanup to fully complete and GTA to settle
-                LOG(LL_DBG, "Waiting 1 second for GTA to fully reset state...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                
-                if (!dualPassContext) {
-                    LOG(LL_ERR, "Pass 2 thread: dualPassContext is NULL!");
-                    g_pass2TriggerIssued = false;
-                    return;
-                }
-                
-                if (dualPassContext->state != DualPassState::PASS1_COMPLETE) {
-                    LOG(LL_WRN, "Pass 2 thread: Unexpected state: ", static_cast<int>(dualPassContext->state));
-                    LOG(LL_WRN, "Expected PASS1_COMPLETE (2), got: ", static_cast<int>(dualPassContext->state));
-                    g_pass2TriggerIssued = false;
-                    return;
-                }
-                
-                LOG(LL_NFO, "Starting Pass 2 (Video Export)");
-                
-                dualPassContext->state = DualPassState::PASS2_PENDING;
-                LOG(LL_NFO, "State changed to PASS2_PENDING");
-                
-                // Restore original FPS settings
-                Config::Manager::fps = dualPassContext->original_fps;
-                Config::Manager::motion_blur_samples = dualPassContext->original_motion_blur_samples;
-                
-                LOG(LL_DBG, "  Restoring FPS: ", Config::Manager::fps.first, "/", Config::Manager::fps.second);
-                LOG(LL_DBG, "  Motion blur: ", Config::Manager::motion_blur_samples);
-                LOG(LL_DBG, "  Video editor interface ptr: ", reinterpret_cast<void*>(dualPassContext->saved_video_editor_interface));
-                LOG(LL_DBG, "  Montage ptr: ", reinterpret_cast<void*>(dualPassContext->saved_montage_ptr));
-                LOG(LL_DBG, "  Audio buffer size: ", dualPassContext->audio_buffer.size(), " bytes");
-                
-                if (!GameHooks::StartBakeProject::OriginalFunc) {
-                    LOG(LL_ERR, "StartBakeProject::OriginalFunc is NULL!");
-                    dualPassContext->state = DualPassState::IDLE;
-                    g_pass2TriggerIssued = false;
-                    return;
-                }
-                
-                if (!dualPassContext->saved_video_editor_interface) {
-                    LOG(LL_ERR, "saved_video_editor_interface is NULL!");
-                    dualPassContext->state = DualPassState::IDLE;
-                    g_pass2TriggerIssued = false;
-                    return;
-                }
-                
-                if (!dualPassContext->saved_montage_ptr) {
-                    LOG(LL_ERR, "saved_montage_ptr is NULL!");
-                    dualPassContext->state = DualPassState::IDLE;
-                    g_pass2TriggerIssued = false;
-                    return;
-                }
-                
-                dualPassContext->state = DualPassState::PASS2_RUNNING;
-                LOG(LL_NFO, "State changed to PASS2_RUNNING");
-                LOG(LL_DBG, "About to call StartBakeProject original function...");
-                
-                bool result = false;
-                try {
-                    result = GameHooks::StartBakeProject::OriginalFunc(
-                        dualPassContext->saved_video_editor_interface,
-                        dualPassContext->saved_montage_ptr
-                    );
-                    LOG(LL_DBG, "StartBakeProject call completed without exception");
-                } catch (const std::exception& e) {
-                    LOG(LL_ERR, "Exception calling StartBakeProject: ", e.what());
-                } catch (...) {
-                    LOG(LL_ERR, "Unknown exception calling StartBakeProject");
-                }
-                
-                LOG(LL_NFO, "Pass 2 StartBakeProject returned: ", result);
-                
-                if (!result) {
-                    LOG(LL_ERR, "Pass 2 FAILED to start");
-                    LOG(LL_ERR, "This typically means GTA rejected the StartBakeProject call");
-                    LOG(LL_ERR, "Possible reasons:");
-                    LOG(LL_ERR, "  1. Playback controller still valid (should be reset by now)");
-                    LOG(LL_ERR, "  2. VideoRecording::StartRecording failed");
-                    LOG(LL_ERR, "  3. Insufficient resources or disk space");
-                    LOG(LL_ERR, "Resetting dual-pass context...");
-                    
-                    dualPassContext->state = DualPassState::IDLE;
-                    dualPassContext->audio_buffer.clear();
-                    dualPassContext->audio_buffer.shrink_to_fit();
-                    g_pass2TriggerIssued = false;
-                } else {
-                    LOG(LL_NFO, "Pass 2 started successfully");
-                    LOG(LL_DBG, "Video capture should now begin at ", Config::Manager::fps.first, "/", Config::Manager::fps.second, " FPS");
-                }
-            }).detach();
-            
-            // Return early
-            LOG(LL_NFO, "Pass 2 thread spawned after cleanup");
+
+            schedulePass2StartupOnMainThread("CleanupReplayPlaybackInternal(pass1-complete)");
+            LOG(LL_NFO, "Pass 2 scheduled - will execute on GTA main thread");
             POST();
             return;
             
@@ -1326,6 +1236,118 @@ namespace {
         }
 
         return isD3D11HookInstalled;
+    }
+
+    void schedulePass2StartupOnMainThread(const char* reason) {
+        if (!dualPassContext) {
+            LOG(LL_ERR, "schedulePass2StartupOnMainThread: dualPassContext is NULL. reason=", reason);
+            g_pass2TriggerIssued = false;
+            g_pass2StartupPending = false;
+            return;
+        }
+
+        if (dualPassContext->state != DualPassState::PASS1_COMPLETE &&
+            dualPassContext->state != DualPassState::PASS2_PENDING) {
+            LOG(LL_WRN, "schedulePass2StartupOnMainThread: unexpected state ",
+                dualPassStateName(dualPassContext->state), " reason=", reason);
+            return;
+        }
+
+        dualPassContext->state = DualPassState::PASS2_PENDING;
+        g_pass2StartupDelayFrames = kPass2StartupDelayFrames;
+        g_pass2StartupPending = true;
+        g_pass2TriggerIssued = true;
+
+        LOG(LL_NFO, "Scheduling Pass 2 startup on main thread after ",
+            Logger::hex(static_cast<uint64_t>(kPass2StartupDelayFrames), 2),
+            " frames. reason=", reason);
+    }
+
+    bool executePass2StartupOnMainThread() {
+        if (!g_pass2StartupPending.load()) {
+            return false;
+        }
+
+        if (std::this_thread::get_id() != mainThreadId) {
+            return false;
+        }
+
+        const int remainingDelay = g_pass2StartupDelayFrames.load();
+        if (remainingDelay > 0) {
+            g_pass2StartupDelayFrames = remainingDelay - 1;
+            return false;
+        }
+
+        g_pass2StartupPending = false;
+
+        LOG(LL_NFO, "=== Pass 2 Startup (Main Thread) ===");
+
+        if (!dualPassContext) {
+            LOG(LL_ERR, "Pass 2 startup: dualPassContext is NULL");
+            g_pass2TriggerIssued = false;
+            return false;
+        }
+
+        if (dualPassContext->state != DualPassState::PASS2_PENDING &&
+            dualPassContext->state != DualPassState::PASS1_COMPLETE) {
+            LOG(LL_WRN, "Pass 2 startup skipped due to state=", dualPassStateName(dualPassContext->state));
+            g_pass2TriggerIssued = false;
+            return false;
+        }
+
+        if (!GameHooks::StartBakeProject::OriginalFunc) {
+            LOG(LL_ERR, "Pass 2 startup: StartBakeProject::OriginalFunc is NULL");
+            dualPassContext->state = DualPassState::IDLE;
+            dualPassContext->audio_buffer.clear();
+            g_pass2TriggerIssued = false;
+            return false;
+        }
+
+        if (!dualPassContext->saved_video_editor_interface || !dualPassContext->saved_montage_ptr) {
+            LOG(LL_ERR, "Pass 2 startup: saved pointers are invalid. interface=",
+                reinterpret_cast<void*>(dualPassContext->saved_video_editor_interface),
+                " montage=", reinterpret_cast<void*>(dualPassContext->saved_montage_ptr));
+            dualPassContext->state = DualPassState::IDLE;
+            dualPassContext->audio_buffer.clear();
+            g_pass2TriggerIssued = false;
+            return false;
+        }
+
+        LOG(LL_NFO, "Starting Pass 2 (Video Export)");
+        dualPassContext->state = DualPassState::PASS2_PENDING;
+        Config::Manager::fps = dualPassContext->original_fps;
+        Config::Manager::motion_blur_samples = dualPassContext->original_motion_blur_samples;
+
+        LOG(LL_DBG, "  Restoring FPS: ", Config::Manager::fps.first, "/", Config::Manager::fps.second);
+        LOG(LL_DBG, "  Motion blur: ", Config::Manager::motion_blur_samples);
+        LOG(LL_DBG, "  Video editor interface ptr: ", reinterpret_cast<void*>(dualPassContext->saved_video_editor_interface));
+        LOG(LL_DBG, "  Montage ptr: ", reinterpret_cast<void*>(dualPassContext->saved_montage_ptr));
+        LOG(LL_DBG, "  Audio buffer size: ", dualPassContext->audio_buffer.size(), " bytes");
+
+        dualPassContext->state = DualPassState::PASS2_RUNNING;
+
+        bool result = false;
+        try {
+            result = GameHooks::StartBakeProject::OriginalFunc(
+                dualPassContext->saved_video_editor_interface,
+                dualPassContext->saved_montage_ptr);
+        } catch (const std::exception& ex) {
+            LOG(LL_ERR, "Pass 2 startup exception: ", ex.what());
+        } catch (...) {
+            LOG(LL_ERR, "Pass 2 startup unknown exception");
+        }
+
+        LOG(LL_NFO, "Pass 2 StartBakeProject returned: ", result);
+        if (!result) {
+            LOG(LL_ERR, "Pass 2 failed to start; resetting dual-pass context");
+            dualPassContext->state = DualPassState::IDLE;
+            dualPassContext->audio_buffer.clear();
+            dualPassContext->audio_buffer.shrink_to_fit();
+            g_pass2TriggerIssued = false;
+            return false;
+        }
+
+        return true;
     }
 
     bool ensureD3D11Hook(bool allowLoadLibrary = true) {
@@ -1877,6 +1899,8 @@ void ever::ScriptMain() {
             ensureD3D11Hook();
         }
 
+        executePass2StartupOnMainThread();
+
         if (dualPassContext) {
             if (dualPassContext->state == DualPassState::PASS1_COMPLETE ||
                 dualPassContext->state == DualPassState::PASS2_PENDING) {
@@ -1887,8 +1911,6 @@ void ever::ScriptMain() {
                 !g_pass2TriggerIssued.load() &&
                 pCleanupReplayPlaybackOriginal != nullptr) {
                 LOG(LL_NFO, "PASS1_COMPLETE detected in ScriptMain. Triggering cleanup gate for pass 2.");
-                g_pass2TriggerIssued = true;
-
                 try {
                     reinterpret_cast<CleanupReplayPlaybackInternalFunc>(pCleanupReplayPlaybackOriginal)();
                     LOG(LL_NFO, "Cleanup trigger dispatched from ScriptMain for pass-2 startup");
@@ -1904,9 +1926,13 @@ void ever::ScriptMain() {
             if (dualPassContext->state == DualPassState::IDLE ||
                 dualPassContext->state == DualPassState::PASS2_COMPLETE) {
                 g_pass2TriggerIssued = false;
+                g_pass2StartupPending = false;
+                g_pass2StartupDelayFrames = 0;
             }
         } else {
             g_pass2TriggerIssued = false;
+            g_pass2StartupPending = false;
+            g_pass2StartupDelayFrames = 0;
         }
         
         WAIT(0);
@@ -1965,7 +1991,7 @@ ImportHooks::SetUnhandledExceptionFilter::Implementation(
         "replacing our UEF with handler at 0x",
         Logger::hex(reinterpret_cast<uint64_t>(lpTopLevelExceptionFilter), 16));
     LOG(LL_WRN, "[CrashHandler] Our Vectored Exception Handler (VEH) is "
-        "UNAFFECTED by this – it will still fire first on any crash.");
+        "UNAFFECTED by this - it will still fire first on any crash.");
 
     // Let GTA install its handler normally.
     return OriginalFunc(lpTopLevelExceptionFilter);
@@ -2580,8 +2606,7 @@ HRESULT IMFSinkWriterHooks::Finalize::Implementation(IMFSinkWriter* pThis) {
                 LOG_CALL(LL_DBG, ::exportContext.reset());
 
                 if (dualPassContext && dualPassContext->state == DualPassState::PASS1_COMPLETE) {
-                    LOG(LL_NFO, "Pass 1 finalize fallback: invoking CleanupReplayPlaybackInternal handoff directly");
-                    CleanupReplayPlaybackInternal_Hook();
+                    LOG(LL_NFO, "Pass 1 finalize: waiting for cleanup hook/ScriptMain to complete handoff to Pass 2");
                 }
 
                 LOG(LL_NFO, "IMFSinkWriter::Finalize exit (Pass 1)");
@@ -2928,45 +2953,49 @@ bool GameHooks::StartBakeProject::Implementation(void* videoEditorInterface, voi
     LOG(LL_NFO, "StartBakeProject called");
     LOG(LL_DBG, "  videoEditorInterface:", videoEditorInterface);
     LOG(LL_DBG, "  montage:", montage);
-    
-                if (dualPassContext && dualPassContext->state == DualPassState::PASS1_RUNNING) {
-                    LOG(LL_NFO, "Pass 1 (audio-only): Skipping FFmpeg encoder creation");
-                    LOG(LL_NFO, "Audio will be buffered in memory");
+
+    if (dualPassContext &&
+        (dualPassContext->state == DualPassState::PASS2_PENDING ||
+         dualPassContext->state == DualPassState::PASS2_RUNNING)) {
+        LOG(LL_NFO, "Internal Pass 2 StartBakeProject execution detected; preserving dual-pass state");
     } else {
-        float gameFrameRate = (static_cast<float>(Config::Manager::fps.first) * 
-                              (static_cast<float>(Config::Manager::motion_blur_samples) + 1) / 
-                              static_cast<float>(Config::Manager::fps.second));
-        
+        const float gameFrameRate =
+            (static_cast<float>(Config::Manager::fps.first) *
+             (static_cast<float>(Config::Manager::motion_blur_samples) + 1) /
+             static_cast<float>(Config::Manager::fps.second));
+
         LOG(LL_NFO, "User-initiated export - effective frame rate: ", gameFrameRate, " FPS");
-        
+
         if (gameFrameRate > 60.0f) {
-            // High frame rate - activate dual-pass mode
             LOG(LL_NFO, "High frame rate detected - activating DUAL-PASS mode");
-            
-            // Initialize dual-pass context
+
             if (!dualPassContext) {
                 dualPassContext.reset(new DualPassContext());
             }
-            
-            // This is Pass 1 - save settings and pointers
+
             dualPassContext->state = DualPassState::PASS1_RUNNING;
             dualPassContext->original_fps = Config::Manager::fps;
             dualPassContext->original_motion_blur_samples = Config::Manager::motion_blur_samples;
             dualPassContext->saved_video_editor_interface = videoEditorInterface;
             dualPassContext->saved_montage_ptr = montage;
+
             g_pass2TriggerIssued = false;
-            
+            g_pass2StartupPending = false;
+            g_pass2StartupDelayFrames = 0;
+
             LOG(LL_NFO, "  PASS 1 will capture audio at 30 FPS, 0 motion blur");
-            LOG(LL_NFO, "  PASS 2 will capture video at ", Config::Manager::fps.first, "/", Config::Manager::fps.second, 
-                       " FPS, ", Config::Manager::motion_blur_samples, " motion blur samples");
+            LOG(LL_NFO, "  PASS 2 will capture video at ", Config::Manager::fps.first, "/", Config::Manager::fps.second,
+                " FPS, ", Config::Manager::motion_blur_samples, " motion blur samples");
             LOG(LL_DBG, "  Saved pointers - interface:", videoEditorInterface, " montage:", montage);
         } else {
             LOG(LL_DBG, "Normal frame rate - single-pass export");
-            
+
             if (dualPassContext && dualPassContext->state != DualPassState::IDLE) {
                 LOG(LL_WRN, "Dual-pass context was not IDLE - resetting");
                 dualPassContext->state = DualPassState::IDLE;
                 g_pass2TriggerIssued = false;
+                g_pass2StartupPending = false;
+                g_pass2StartupDelayFrames = 0;
             }
         }
     }
@@ -3022,6 +3051,30 @@ bool GameHooks::ShouldShowLoadingScreen::Implementation() {
     if (dualPassContext &&
         (dualPassContext->state == DualPassState::PASS1_COMPLETE ||
          dualPassContext->state == DualPassState::PASS2_PENDING)) {
+        if (dualPassContext->state == DualPassState::PASS1_COMPLETE &&
+            !g_pass2TriggerIssued.load() &&
+            !g_pass2StartupPending.load() &&
+            pCleanupReplayPlaybackOriginal != nullptr &&
+            std::this_thread::get_id() == mainThreadId) {
+            LOG(LL_NFO, "ShouldShowLoadingScreen: PASS1_COMPLETE handoff trigger via main-thread fallback");
+            try {
+                reinterpret_cast<CleanupReplayPlaybackInternalFunc>(pCleanupReplayPlaybackOriginal)();
+            } catch (const std::exception& ex) {
+                LOG(LL_ERR, "ShouldShowLoadingScreen fallback handoff exception: ", ex.what());
+                g_pass2TriggerIssued = false;
+            } catch (...) {
+                LOG(LL_ERR, "ShouldShowLoadingScreen fallback handoff unknown exception");
+                g_pass2TriggerIssued = false;
+            }
+        }
+
+        if (dualPassContext->state == DualPassState::PASS2_PENDING &&
+            g_pass2StartupPending.load() &&
+            std::this_thread::get_id() == mainThreadId) {
+            LOG(LL_NFO, "ShouldShowLoadingScreen: firing Pass 2 startup on main thread (WAIT(0) blocked in loading-screen loop)");
+            executePass2StartupOnMainThread();
+        }
+
         if (!originalResult) {
             LOG(LL_DBG, "Forcing loading screen ON during dual-pass handoff. state=",
                 dualPassStateName(dualPassContext->state));
